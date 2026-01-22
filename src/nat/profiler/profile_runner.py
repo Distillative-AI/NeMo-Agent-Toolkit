@@ -45,6 +45,7 @@ class InferenceOptimizationHolder(BaseModel):
     common_prefixes: Any
     token_uniqueness: Any
     workflow_runtimes: Any
+    dynamo_metrics: Any = None
 
 
 class ProfilerRunner:
@@ -187,10 +188,25 @@ class ProfilerRunner:
             workflow_runtimes = compute_workflow_runtime_metrics(all_steps)
             workflow_runtimes_results = workflow_runtimes
 
+        # ------------------------------------------------------------
+        # Collect Dynamo inference stack metrics (if enabled)
+        # ------------------------------------------------------------
+        dynamo_metrics_results = None
+        if self.profile_config.dynamo_metrics.enable:
+            from nat.profiler.inference_optimization.dynamo_metrics import collect_dynamo_metrics
+            try:
+                dynamo_metrics_results = await collect_dynamo_metrics(self.profile_config.dynamo_metrics)
+                if dynamo_metrics_results.errors:
+                    logger.warning("Dynamo metrics collection had errors: %s", dynamo_metrics_results.errors)
+                logger.info("Collected Dynamo metrics successfully")
+            except Exception as e:
+                logger.warning("Failed to collect Dynamo metrics: %s", e)
+
         inference_optimization_results = InferenceOptimizationHolder(confidence_intervals=simple_metrics,
                                                                      common_prefixes=common_prefix_results,
                                                                      token_uniqueness=token_uniqueness_results,
-                                                                     workflow_runtimes=workflow_runtimes_results)
+                                                                     workflow_runtimes=workflow_runtimes_results,
+                                                                     dynamo_metrics=dynamo_metrics_results)
 
         if self.write_output and inference_optimization_results:
             # Save to JSON
