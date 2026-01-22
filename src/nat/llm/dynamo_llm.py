@@ -13,14 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Dynamo LLM provider with automatic prefix header injection for KV cache optimization.
+Dynamo LLM provider with automatic prefix injection for KV cache optimization.
 
-This module provides a specialized OpenAI-compatible LLM that sends Dynamo prefix headers
+This module provides a specialized OpenAI-compatible LLM that sends Dynamo prefix hints
 for optimal KV cache management and request routing. The prefix parameters are optimizable
 via the NAT optimizer.
 
-The implementation uses httpx event hooks to inject headers at the HTTP transport level,
+The implementation uses httpx event hooks to inject hints at the HTTP transport level,
 making it framework-agnostic (works with LangChain, LlamaIndex, etc.).
+
+Transport Mechanisms
+--------------------
+
+This module supports two transport mechanisms for routing hints, used simultaneously
+for maximum compatibility:
+
+1. **HTTP Headers** (``x-prefix-*``): For the generalized Thompson Sampling setup
+   that uses custom ``frontend.py`` which reads headers directly.
+   *DEPRECATED: Will be removed when start_dynamo_unified_thompson_hints.sh is retired.*
+
+2. **nvext.annotations** (in request body): For the optimized Thompson Sampling setup
+   that uses the default Dynamo frontend with custom ``processor.py`` which reads
+   annotations from the preprocessed request. *This is the preferred mechanism.*
 
 Dynamo Prefix Parameters
 -------------------------
@@ -46,6 +60,7 @@ prefix_total_requests
     - Lower values allow more load balancing
 """
 
+import json
 import logging
 import uuid
 from collections.abc import Callable
@@ -164,14 +179,20 @@ class DynamoPrefixContext:
 
 class DynamoModelConfig(OpenAIModelConfig, name="dynamo"):
     """
-    A Dynamo LLM provider with automatic prefix header injection for KV cache optimization.
+    A Dynamo LLM provider with automatic prefix hint injection for KV cache optimization.
 
-    This is a specialized OpenAI-compatible LLM that sends Dynamo prefix headers
-    for optimal KV cache management and request routing. Prefix headers are enabled
+    This is a specialized OpenAI-compatible LLM that sends Dynamo prefix hints
+    for optimal KV cache management and request routing. Prefix hints are enabled
     by default using the template "nat-dynamo-{uuid}". The prefix routing parameters
     (prefix_total_requests, prefix_osl, prefix_iat) are optimizable via the NAT optimizer.
 
-    To disable prefix headers, set prefix_template to null/None in your config.
+    Hints are sent via both HTTP headers (``x-prefix-*``) and ``nvext.annotations``
+    in the request body for compatibility with different Dynamo setups:
+
+    - **Generalized Thompson Sampling** (custom frontend.py): Reads HTTP headers
+    - **Optimized Thompson Sampling** (default frontend + processor.py): Reads nvext.annotations
+
+    To disable prefix hints, set prefix_template to null/None in your config.
     """
 
     # =========================================================================
@@ -257,15 +278,24 @@ def _create_dynamo_request_hook(
     iat: str,
 ) -> Callable[["httpx.Request"], Coroutine[Any, Any, None]]:
     """
-    Create an httpx event hook that injects Dynamo prefix headers into requests.
+    Create an httpx event hook that injects Dynamo prefix hints into requests.
 
     This hook is called before each HTTP request is sent, allowing us to inject
-    headers dynamically. The prefix ID is generated ONCE when the hook is created,
+    hints dynamically. The prefix ID is generated ONCE when the hook is created,
     ensuring all requests from the same client share the same prefix ID. This enables
     Dynamo's KV cache optimization across multi-turn conversations.
 
     The context variable can override this for scenarios where you need different
     prefix IDs (e.g., per-question in batch evaluation).
+
+    Hints are injected via TWO transport mechanisms for maximum compatibility:
+
+    1. **HTTP Headers** (``x-prefix-*``): For the generalized Thompson Sampling setup
+       that uses custom ``frontend.py`` which reads headers directly.
+
+    2. **nvext.annotations** (in request body): For the optimized Thompson Sampling
+       setup that uses the default Dynamo frontend with custom ``processor.py``
+       which reads annotations from the preprocessed request.
 
     Args:
         prefix_template: Template string with {uuid} placeholder
@@ -287,7 +317,7 @@ def _create_dynamo_request_hook(
     logger.debug("Created Dynamo request hook with default prefix ID: %s", default_prefix_id)
 
     async def on_request(request):
-        """Inject Dynamo prefix headers before each request."""
+        """Inject Dynamo prefix hints into request headers AND body."""
         # Check context variable first (allows per-question override in batch evaluation)
         context_prefix_id = DynamoPrefixContext.get()
 
@@ -299,13 +329,76 @@ def _create_dynamo_request_hook(
             prefix_id = default_prefix_id
             logger.debug("Using default prefix ID: %s", prefix_id)
 
-        # Inject Dynamo headers
+        # =====================================================================
+        # Transport 1: HTTP Headers (for generalized Thompson Sampling setup)
+        # The custom frontend.py reads these headers directly.
+        #
+        # DEPRECATION NOTE: This transport mechanism exists solely for backwards
+        # compatibility with start_dynamo_unified_thompson_hints.sh which uses
+        # custom frontend.py/processor.py that read x-prefix-* headers.
+        # Once that setup is deprecated in favor of the optimized setup
+        # (start_dynamo_optimized_thompson_hints.sh), this header injection
+        # can be removed entirely - only nvext.annotations will be needed.
+        #
+        # AI PROMPT TO REMOVE HTTP HEADERS (use when generalized setup is deprecated):
+        # "Remove the HTTP header injection (x-prefix-*) from dynamo_llm.py.
+        # Keep only the nvext.annotations transport mechanism. Update docstrings
+        # to remove references to HTTP headers and the generalized Thompson
+        # Sampling setup. The start_dynamo_unified_thompson_hints.sh script
+        # and its custom frontend.py/processor.py are now deprecated."
+        # =====================================================================
         request.headers["x-prefix-id"] = prefix_id
         request.headers["x-prefix-total-requests"] = str(total_requests)
         request.headers["x-prefix-osl"] = osl.upper()
         request.headers["x-prefix-iat"] = iat.upper()
 
-        logger.debug("Injected Dynamo headers: prefix_id=%s, total_requests=%d, osl=%s, iat=%s",
+        # =====================================================================
+        # Transport 2: nvext.annotations (for optimized Thompson Sampling setup)
+        # The default Dynamo frontend passes these through to processor.py
+        # which extracts them from the PreprocessedRequest.annotations field.
+        # =====================================================================
+        if request.method == "POST" and request.content:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+                if isinstance(body, dict):
+                    # Build annotations list in "key:value" format
+                    annotations = [
+                        f"prefix_id:{prefix_id}",
+                        f"total_requests:{total_requests}",
+                        f"osl:{osl.upper()}",
+                        f"iat:{iat.upper()}",
+                    ]
+
+                    # Add/merge nvext.annotations
+                    if "nvext" not in body:
+                        body["nvext"] = {}
+                    if not isinstance(body["nvext"], dict):
+                        body["nvext"] = {}
+
+                    # Preserve any existing annotations and add ours
+                    existing = body["nvext"].get("annotations", [])
+                    if not isinstance(existing, list):
+                        existing = []
+
+                    # Our annotations take precedence (placed first)
+                    body["nvext"]["annotations"] = annotations + [
+                        a for a in existing
+                        if not any(a.startswith(f"{key}:") for key in ["prefix_id", "total_requests", "osl", "iat"])
+                    ]
+
+                    # Re-encode the body
+                    new_content = json.dumps(body).encode("utf-8")
+                    # Update the request content (httpx allows this via _content)
+                    request._content = new_content
+                    request.headers["content-length"] = str(len(new_content))
+
+                    logger.debug("Injected nvext.annotations: %s", body["nvext"]["annotations"])
+
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                # Not JSON or encoding issue - skip body injection, headers still work
+                logger.debug("Could not inject nvext.annotations (body not JSON): %s", e)
+
+        logger.debug("Injected Dynamo hints: prefix_id=%s, total_requests=%d, osl=%s, iat=%s",
                      prefix_id,
                      total_requests,
                      osl.upper(),
@@ -322,10 +415,16 @@ def create_httpx_client_with_dynamo_hooks(
     timeout: float = 600.0,
 ) -> "httpx.AsyncClient":
     """
-    Create an httpx.AsyncClient with Dynamo prefix header injection.
+    Create an httpx.AsyncClient with Dynamo prefix hint injection.
 
-    This client can be passed to the OpenAI SDK to inject headers at the HTTP level,
-    making it framework-agnostic.
+    This client can be passed to the OpenAI SDK to inject hints at the HTTP level,
+    making it framework-agnostic. Hints are injected via both HTTP headers and
+    nvext.annotations in the request body for maximum compatibility with different
+    Dynamo setups:
+
+    - **Generalized setup** (custom frontend.py): Reads ``x-prefix-*`` HTTP headers
+    - **Optimized setup** (default frontend + custom processor.py): Reads
+      ``nvext.annotations`` from the request body
 
     Args:
         prefix_template: Template string with {uuid} placeholder
@@ -335,7 +434,7 @@ def create_httpx_client_with_dynamo_hooks(
         timeout: HTTP request timeout in seconds
 
     Returns:
-        An httpx.AsyncClient configured with Dynamo header injection.
+        An httpx.AsyncClient configured with Dynamo hint injection.
     """
     import httpx
 

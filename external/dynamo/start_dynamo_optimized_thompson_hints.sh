@@ -50,7 +50,7 @@
 set -euo pipefail
 
 # Configuration Variables (can be overridden via environment variables)
-CONTAINER_NAME="dynamo-sglang-optimized"
+CONTAINER_NAME="dynamo-sglang"
 WORKER_GPUS="${DYNAMO_GPU_DEVICES:-0,1,2,3}"
 TP_SIZE="${DYNAMO_TP_SIZE:-4}"
 HTTP_PORT="${DYNAMO_HTTP_PORT:-8000}"
