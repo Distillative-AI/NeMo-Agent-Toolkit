@@ -219,50 +219,50 @@ class ProcessorMetrics:
         Args:
             endpoint: Dynamo endpoint object providing the metrics interface.
         """
-        # Request throughput
+        # Request throughput (prefixed with thompson_ to avoid conflicts with
+        # serve_endpoint's built-in work handler metrics)
         self.requests_total = endpoint.metrics.create_intcounter(
-            "requests_total",
+            "thompson_requests_total",
             "Total requests processed by the Thompson Sampling processor",
         )
 
-        # Latency histogram with buckets suited for LLM inference
-        # Buckets: 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s, 30s, 60s, 120s
+        # Latency histogram (uses default Prometheus buckets since Python binding
+        # doesn't expose custom bucket configuration in Dynamo 0.7.1)
         self.request_latency_seconds = endpoint.metrics.create_histogram(
-            "request_latency_seconds",
+            "thompson_request_latency_seconds",
             "End-to-end request latency in seconds",
-            buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0],
         )
 
         # Token throughput
         self.tokens_in_total = endpoint.metrics.create_intcounter(
-            "tokens_in_total",
+            "thompson_tokens_in_total",
             "Total input tokens processed",
         )
         self.tokens_out_total = endpoint.metrics.create_intcounter(
-            "tokens_out_total",
+            "thompson_tokens_out_total",
             "Total output tokens generated",
         )
 
         # Routing decisions by worker (for analyzing load distribution)
         self.routing_decisions_total = endpoint.metrics.create_intcountervec(
-            "routing_decisions_total",
+            "thompson_routing_decisions_total",
             "Routing decisions by worker",
             ["worker_id"],
         )
 
         # Error tracking
         self.router_errors_total = endpoint.metrics.create_intcounter(
-            "router_errors_total",
+            "thompson_router_errors_total",
             "Router communication errors (failed to pick worker)",
         )
         self.engine_errors_total = endpoint.metrics.create_intcounter(
-            "engine_errors_total",
+            "thompson_engine_errors_total",
             "Backend engine errors (failed during streaming)",
         )
 
         # Active request gauge
         self.active_requests = endpoint.metrics.create_intgauge(
-            "active_requests",
+            "thompson_active_requests",
             "Currently active requests being processed",
         )
 
@@ -272,25 +272,25 @@ class ProcessorMetrics:
         # Efficiency = kve_cached_tokens_total / kve_prompt_tokens_total
         # -----------------------------------------------------------------
         self.kve_prompt_tokens_total = endpoint.metrics.create_intcounter(
-            "kve_prompt_tokens_total",
+            "thompson_kve_prompt_tokens_total",
             "Total prompt tokens processed (KV efficiency denominator)",
         )
         self.kve_cached_tokens_total = endpoint.metrics.create_intcounter(
-            "kve_cached_tokens_total",
+            "thompson_kve_cached_tokens_total",
             "Total cached tokens hit (KV efficiency numerator)",
         )
 
         # Cache hit breakdown by memory tier (for analyzing cache hierarchy)
         self.kve_device_blocks_total = endpoint.metrics.create_intcounter(
-            "kve_device_blocks_total",
+            "thompson_kve_device_blocks_total",
             "KV cache blocks hit from device (GPU) memory",
         )
         self.kve_host_blocks_total = endpoint.metrics.create_intcounter(
-            "kve_host_blocks_total",
+            "thompson_kve_host_blocks_total",
             "KV cache blocks hit from host (CPU) memory",
         )
         self.kve_disk_blocks_total = endpoint.metrics.create_intcounter(
-            "kve_disk_blocks_total",
+            "thompson_kve_disk_blocks_total",
             "KV cache blocks hit from disk storage",
         )
 
