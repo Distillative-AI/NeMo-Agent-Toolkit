@@ -63,13 +63,10 @@ prefix_total_requests
 import json
 import logging
 import uuid
-from collections.abc import Callable
-from collections.abc import Coroutine
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
-from typing import Any
 from typing import Literal
 
 if TYPE_CHECKING:
@@ -267,144 +264,98 @@ class DynamoModelConfig(OpenAIModelConfig, name="dynamo"):
 
 
 # =============================================================================
-# HTTPX EVENT HOOK FOR HEADER INJECTION
+# CUSTOM TRANSPORT FOR DYNAMO HINT INJECTION
 # =============================================================================
 
 
-def _create_dynamo_request_hook(
-    prefix_template: str | None,
-    total_requests: int,
-    osl: str,
-    iat: str,
-) -> Callable[["httpx.Request"], Coroutine[Any, Any, None]]:
+class _DynamoTransport:
     """
-    Create an httpx event hook that injects Dynamo prefix hints into requests.
-
-    This hook is called before each HTTP request is sent, allowing us to inject
-    hints dynamically. The prefix ID is generated ONCE when the hook is created,
-    ensuring all requests from the same client share the same prefix ID. This enables
-    Dynamo's KV cache optimization across multi-turn conversations.
-
-    The context variable can override this for scenarios where you need different
-    prefix IDs (e.g., per-question in batch evaluation).
-
-    Hints are injected via TWO transport mechanisms for maximum compatibility:
-
-    1. **HTTP Headers** (``x-prefix-*``): For the generalized Thompson Sampling setup
-       that uses custom ``frontend.py`` which reads headers directly.
-
-    2. **nvext.annotations** (in request body): For the optimized Thompson Sampling
-       setup that uses the default Dynamo frontend with custom ``processor.py``
-       which reads annotations from the preprocessed request.
-
-    Args:
-        prefix_template: Template string with {uuid} placeholder
-        total_requests: Expected number of requests for this prefix
-        osl: Output sequence length hint (LOW/MEDIUM/HIGH)
-        iat: Inter-arrival time hint (LOW/MEDIUM/HIGH)
-
-    Returns:
-        An async function suitable for use as an httpx event hook.
+    Custom transport wrapper that injects nvext.annotations into request bodies.
+    
+    This approach is more reliable than using event hooks because it modifies
+    the request BEFORE httpx's internal state machine processes it.
     """
-    # Generate the default prefix ID ONCE when the hook is created
-    # This ensures all requests from this client share the same prefix ID
-    unique_id = uuid.uuid4().hex[:16]
-    if prefix_template:
-        default_prefix_id = prefix_template.format(uuid=unique_id)
-    else:
-        default_prefix_id = f"nat-dynamo-{unique_id}"
-
-    logger.debug("Created Dynamo request hook with default prefix ID: %s", default_prefix_id)
-
-    async def on_request(request):
-        """Inject Dynamo prefix hints into request headers AND body."""
+    
+    def __init__(
+        self,
+        transport: "httpx.AsyncBaseTransport",
+        prefix_id: str,
+        total_requests: int,
+        osl: str,
+        iat: str,
+    ):
+        self._transport = transport
+        self._prefix_id = prefix_id
+        self._total_requests = total_requests
+        self._osl = osl.upper()
+        self._iat = iat.upper()
+    
+    async def handle_async_request(self, request: "httpx.Request") -> "httpx.Response":
+        import httpx
+        
         # Check context variable first (allows per-question override in batch evaluation)
         context_prefix_id = DynamoPrefixContext.get()
-
-        if context_prefix_id:
-            prefix_id = context_prefix_id
-            logger.debug("Using context prefix ID: %s", prefix_id)
-        else:
-            # Use the pre-generated prefix ID (same for all requests from this client)
-            prefix_id = default_prefix_id
-            logger.debug("Using default prefix ID: %s", prefix_id)
-
-        # =====================================================================
-        # Transport 1: HTTP Headers (for generalized Thompson Sampling setup)
-        # The custom frontend.py reads these headers directly.
-        #
-        # DEPRECATION NOTE: This transport mechanism exists solely for backwards
-        # compatibility with start_dynamo_unified_thompson_hints.sh which uses
-        # custom frontend.py/processor.py that read x-prefix-* headers.
-        # Once that setup is deprecated in favor of the optimized setup
-        # (start_dynamo_optimized_thompson_hints.sh), this header injection
-        # can be removed entirely - only nvext.annotations will be needed.
-        #
-        # AI PROMPT TO REMOVE HTTP HEADERS (use when generalized setup is deprecated):
-        # "Remove the HTTP header injection (x-prefix-*) from dynamo_llm.py.
-        # Keep only the nvext.annotations transport mechanism. Update docstrings
-        # to remove references to HTTP headers and the generalized Thompson
-        # Sampling setup. The start_dynamo_unified_thompson_hints.sh script
-        # and its custom frontend.py/processor.py are now deprecated."
-        # =====================================================================
-        request.headers["x-prefix-id"] = prefix_id
-        request.headers["x-prefix-total-requests"] = str(total_requests)
-        request.headers["x-prefix-osl"] = osl.upper()
-        request.headers["x-prefix-iat"] = iat.upper()
-
-        # =====================================================================
-        # Transport 2: nvext.annotations (for optimized Thompson Sampling setup)
-        # The default Dynamo frontend passes these through to processor.py
-        # which extracts them from the PreprocessedRequest.annotations field.
-        # =====================================================================
-        if request.method == "POST" and request.content:
+        prefix_id = context_prefix_id if context_prefix_id else self._prefix_id
+        
+        # Add HTTP headers (for generalized setup compatibility)
+        headers = dict(request.headers)
+        headers["x-prefix-id"] = prefix_id
+        headers["x-prefix-total-requests"] = str(self._total_requests)
+        headers["x-prefix-osl"] = self._osl
+        headers["x-prefix-iat"] = self._iat
+        
+        # Modify body if it's a POST request with JSON content
+        content = request.content
+        if request.method == "POST" and content:
             try:
-                body = json.loads(request.content.decode("utf-8"))
+                body = json.loads(content.decode("utf-8"))
                 if isinstance(body, dict):
-                    # Build annotations list in "key:value" format
+                    # Build annotations list
                     annotations = [
                         f"prefix_id:{prefix_id}",
-                        f"total_requests:{total_requests}",
-                        f"osl:{osl.upper()}",
-                        f"iat:{iat.upper()}",
+                        f"total_requests:{self._total_requests}",
+                        f"osl:{self._osl}",
+                        f"iat:{self._iat}",
                     ]
-
+                    
                     # Add/merge nvext.annotations
                     if "nvext" not in body:
                         body["nvext"] = {}
                     if not isinstance(body["nvext"], dict):
                         body["nvext"] = {}
-
-                    # Preserve any existing annotations and add ours
+                    
                     existing = body["nvext"].get("annotations", [])
                     if not isinstance(existing, list):
                         existing = []
-
-                    # Our annotations take precedence (placed first)
+                    
+                    # Our annotations take precedence
                     body["nvext"]["annotations"] = annotations + [
                         a for a in existing
                         if not any(a.startswith(f"{key}:") for key in ["prefix_id", "total_requests", "osl", "iat"])
                     ]
-
-                    # Re-encode the body
-                    new_content = json.dumps(body).encode("utf-8")
-                    # Update the request content (httpx allows this via _content)
-                    request._content = new_content
-                    request.headers["content-length"] = str(len(new_content))
-
-                    logger.debug("Injected nvext.annotations: %s", body["nvext"]["annotations"])
-
+                    
+                    # Re-encode
+                    content = json.dumps(body).encode("utf-8")
+                    headers["content-length"] = str(len(content))
+                    
+                    logger.debug("Injected nvext.annotations: %s (body size: %d bytes)",
+                                 body["nvext"]["annotations"], len(content))
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                # Not JSON or encoding issue - skip body injection, headers still work
-                logger.debug("Could not inject nvext.annotations (body not JSON): %s", e)
-
-        logger.debug("Injected Dynamo hints: prefix_id=%s, total_requests=%d, osl=%s, iat=%s",
-                     prefix_id,
-                     total_requests,
-                     osl.upper(),
-                     iat.upper())
-
-    return on_request
+                logger.debug("Could not inject nvext.annotations: %s", e)
+        
+        # Create a new request with modified headers and content
+        new_request = httpx.Request(
+            method=request.method,
+            url=request.url,
+            headers=headers,
+            content=content,
+            extensions=request.extensions,
+        )
+        
+        return await self._transport.handle_async_request(new_request)
+    
+    async def aclose(self):
+        await self._transport.aclose()
 
 
 def create_httpx_client_with_dynamo_hooks(
@@ -438,10 +389,27 @@ def create_httpx_client_with_dynamo_hooks(
     """
     import httpx
 
-    request_hook = _create_dynamo_request_hook(prefix_template, total_requests, osl, iat)
-
+    # Generate the prefix ID once
+    unique_id = uuid.uuid4().hex[:16]
+    if prefix_template:
+        prefix_id = prefix_template.format(uuid=unique_id)
+    else:
+        prefix_id = f"nat-dynamo-{unique_id}"
+    
+    logger.debug("Created Dynamo client with prefix ID: %s", prefix_id)
+    
+    # Create a base transport and wrap it with our custom transport
+    base_transport = httpx.AsyncHTTPTransport()
+    dynamo_transport = _DynamoTransport(
+        transport=base_transport,
+        prefix_id=prefix_id,
+        total_requests=total_requests,
+        osl=osl,
+        iat=iat,
+    )
+    
     return httpx.AsyncClient(
-        event_hooks={"request": [request_hook]},
+        transport=dynamo_transport,
         timeout=httpx.Timeout(timeout),
     )
 

@@ -142,7 +142,7 @@ llms:
   dynamo_llm:
     _type: dynamo
     model_name: llama-3.3-70b
-    base_url: http://localhost:8099/v1
+    base_url: http://localhost:8000/v1
     api_key: dummy
     temperature: 0.0
     max_tokens: 8192
@@ -163,7 +163,7 @@ llms:
   eval_llm:
     _type: dynamo
     model_name: llama-3.3-70b
-    base_url: http://localhost:8099/v1
+    base_url: http://localhost:8000/v1
     api_key: dummy
     temperature: 0.0
     max_tokens: 1024
@@ -199,7 +199,7 @@ workflow:
 
 eval:
   general:
-    max_concurrency: 36
+    max_concurrency: 1
     
     output:
       dir: ./examples/dynamo_integration/react_benchmark_agent/outputs/dynamo_evals/rethinking_full_test_for_profiling/
