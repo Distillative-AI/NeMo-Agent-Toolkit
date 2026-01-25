@@ -199,7 +199,7 @@ workflow:
 
 eval:
   general:
-    max_concurrency: 1
+    max_concurrency: 8
     
     output:
       dir: ./examples/dynamo_integration/react_benchmark_agent/outputs/dynamo_evals/rethinking_full_test_for_profiling/

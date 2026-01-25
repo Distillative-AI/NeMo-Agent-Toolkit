@@ -153,6 +153,26 @@ class DynamoMetricsConfig(BaseModel):
         "Should roughly match experiment duration. Too short = noisy. Too long = stale data included.",
     )
 
+    # Historical lookback for range queries (set automatically from workflow duration if 0)
+    lookback_seconds: float = Field(
+        default=0.0,
+        description="Lookback time in seconds for Prometheus range queries when instant queries return no data. "
+        "If 0 (default), will be set automatically to the workflow duration + buffer. "
+        "This allows capturing TTFT/ITL metrics from the entire eval run, even after the workflow completes.",
+    )
+
+    # Workflow time window (set automatically by profiler)
+    workflow_start_timestamp: float | None = Field(
+        default=None,
+        description="Unix timestamp when the workflow started (set automatically by profiler). "
+        "Used for precise range query time windows.",
+    )
+    workflow_end_timestamp: float | None = Field(
+        default=None,
+        description="Unix timestamp when the workflow ended (set automatically by profiler). "
+        "Used for precise range query time windows to isolate metrics to this eval run.",
+    )
+
     @classmethod
     def core_metrics_only(
         cls,

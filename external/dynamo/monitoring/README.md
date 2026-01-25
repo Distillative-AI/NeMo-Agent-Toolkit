@@ -58,9 +58,11 @@ docker compose up -d
 | Component | Port | URL | Description |
 |-----------|------|-----|-------------|
 | Frontend | 8000 | `http://localhost:8000/metrics` | User-facing metrics (latency, throughput) |
-| Worker | 8081 | `http://localhost:8081/metrics` | Internal metrics (KV cache, NATS stats) |
-| Router | 8082 | `http://localhost:8082/metrics` | Thompson Sampling routing metrics |
-| Processor | 8083 | `http://localhost:8083/metrics` | Thompson Sampling KVE metrics |
+| Workers | 18081-180xx | `http://localhost:18081/metrics` | Internal metrics (KV cache, NATS stats) - one port per worker |
+| Router | 18090 | `http://localhost:18090/metrics` | Thompson Sampling routing metrics |
+| Processor | 18091 | `http://localhost:18091/metrics` | Thompson Sampling KVE metrics |
+
+**Note**: Worker metrics ports are sequential starting at 18081. With 2 workers: 18081, 18082. With 4 workers: 18081-18084.
 
 ## Key Metrics
 
@@ -158,18 +160,34 @@ Custom Thompson Sampling KV Efficiency (KVE) metrics from the processor componen
 | `dynamo_component_thompson_kve_` | `dynamo_component_thompson_kve_host_blocks_total` | Counter | KV blocks from CPU memory |
 | `dynamo_component_thompson_kve_` | `dynamo_component_thompson_kve_disk_blocks_total` | Counter | KV blocks from disk |
 
-**KV Efficiency (KVE) Calculation:**
-```promql
-# KV Cache Efficiency percentage (using SGLang native metric - RECOMMENDED)
-sglang:cache_hit_rate * 100
+**KV Cache Efficiency Score (KVES) Calculation:**
 
-# Alternative: Using processor counters (may show 0 if SGLang doesn't return cached_tokens in API)
-# rate(dynamo_component_thompson_kve_cached_tokens_total[5m]) / rate(dynamo_component_thompson_kve_prompt_tokens_total[5m]) * 100
+The full KVES formula is:
+```
+KVES = (TotalWork - ActualWork) / TotalWork ∈ [0,1]
+     where 0 = no cache benefit, 1 = full reuse
+
+ActualWork = <w_hit, h> + w_compute * recomputed_prefill_blocks * block_size
+TotalWork = cached_prompt_blocks * block_size
+w_hit = (w_gpu_hit, w_cpu_hit, w_disk_hit)  # weights per hit source
+```
+
+Since CPU/disk hit metrics are not available in SGLang (KVBM not yet supported), we use a **simplified KVES proxy**:
+
+```promql
+# KVES Proxy (using SGLang native metric - RECOMMENDED)
+sglang:cache_hit_rate
+
+# As percentage
+sglang:cache_hit_rate * 100
 ```
 
 > **Why use SGLang's native metric?** SGLang computes cache hit rate internally but doesn't include
 > `cached_tokens` in its API responses. The processor's `thompson_kve_*` counters will show 0
 > unless the underlying engine provides `usage.prompt_tokens_details.cached_tokens`.
+
+> **Note on Full KVES**: To implement the full KVES equation with CPU/disk hit weights, you would need
+> to switch to vLLM with KVBM enabled, which provides GPU→CPU→Disk tiered caching with proper metrics.
 
 ## KV Cache Metrics Status
 
@@ -244,12 +262,20 @@ The pre-configured dashboard "Dynamo LLM Overview" includes:
 1. **Inflight Requests** - Current load across all components
 2. **Requests/min** - Throughput
 3. **Time to First Token (P95)** - Latency to start generating
-4. **Cache Hit Rate %** - Prefix cache hit rate (may be 0 without repeated prefix queries)
+4. **KVES Proxy (Cache Hit Rate %)** - KV Efficiency Score proxy using prefix cache hit rate
 5. **TTFT Over Time** - P50/P95/P99 latency trends
 6. **ITL Over Time** - Inter-token latency trends
 7. **Token Throughput** - Tokens generated per second
 8. **KV Cache Usage** - Memory usage % and prefix cache hit rate % over time
 9. **KV Cache Tokens & Throughput** - Absolute token count and generation throughput
+10. **KV Cache Details (Per-Worker)** - Detailed per-worker metrics including:
+    - KVES: Prefix hit rate (%) - `avg_over_time(sglang:cache_hit_rate[1m]) * 100`
+    - KV Usage (%) - `avg_over_time(sglang:token_usage[1m]) * 100`
+    - KV Tokens Used - `last_over_time(sglang:num_used_tokens[1m])`
+    - KV Capacity (blocks) - `last_over_time(dynamo_component_kvstats_total_blocks[1m])`
+    - Frontend Block Size - `last_over_time(dynamo_frontend_model_kv_cache_block_size[5m])`
+11. **KVES Proxy by Worker** - Color-coded efficiency score per worker (0-1 scale)
+12. **KV Cache Memory Usage % by Worker** - Per-worker memory utilization
 
 ### Thompson Sampling Panels (Included)
 
@@ -305,8 +331,37 @@ docker compose logs -f grafana
 ### Reset Data (Start Fresh)
 
 ```bash
-docker compose down -v  # Removes volumes
+docker compose down -v  # Removes ALL volumes (Prometheus + Grafana data)
 docker compose up -d
+```
+
+### Clear Prometheus Data Only
+
+If you're seeing duplicate labels in Grafana (for example, after restarting workers with new IDs), you can clear just the Prometheus data while keeping Grafana settings:
+
+```bash
+# Stop the monitoring containers
+docker stop dynamo-prometheus dynamo-grafana
+docker rm dynamo-prometheus dynamo-grafana
+
+# Remove just the Prometheus data volume (clears all historical metrics)
+docker volume rm monitoring_prometheus_data && echo "Prometheus data volume removed (old metrics cleared)"
+
+# Restart the monitoring stack with fresh data
+docker compose up -d
+```
+
+Alternatively, use the stop script with the `--kill-metrics` flag:
+
+```bash
+# From the dynamo directory
+bash stop_dynamo.sh --kill-metrics
+
+# Then remove the Prometheus volume
+docker volume rm monitoring_prometheus_data
+
+# Restart everything (monitoring will start automatically)
+bash start_dynamo_optimized_thompson_hints.sh
 ```
 
 ## Remote Access via SSH Port Forwarding

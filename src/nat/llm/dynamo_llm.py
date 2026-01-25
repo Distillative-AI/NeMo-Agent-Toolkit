@@ -271,11 +271,11 @@ class DynamoModelConfig(OpenAIModelConfig, name="dynamo"):
 class _DynamoTransport:
     """
     Custom transport wrapper that injects nvext.annotations into request bodies.
-    
+
     This approach is more reliable than using event hooks because it modifies
     the request BEFORE httpx's internal state machine processes it.
     """
-    
+
     def __init__(
         self,
         transport: "httpx.AsyncBaseTransport",
@@ -289,21 +289,21 @@ class _DynamoTransport:
         self._total_requests = total_requests
         self._osl = osl.upper()
         self._iat = iat.upper()
-    
+
     async def handle_async_request(self, request: "httpx.Request") -> "httpx.Response":
         import httpx
-        
+
         # Check context variable first (allows per-question override in batch evaluation)
         context_prefix_id = DynamoPrefixContext.get()
         prefix_id = context_prefix_id if context_prefix_id else self._prefix_id
-        
+
         # Add HTTP headers (for generalized setup compatibility)
         headers = dict(request.headers)
         headers["x-prefix-id"] = prefix_id
         headers["x-prefix-total-requests"] = str(self._total_requests)
         headers["x-prefix-osl"] = self._osl
         headers["x-prefix-iat"] = self._iat
-        
+
         # Modify body if it's a POST request with JSON content
         content = request.content
         if request.method == "POST" and content:
@@ -317,32 +317,33 @@ class _DynamoTransport:
                         f"osl:{self._osl}",
                         f"iat:{self._iat}",
                     ]
-                    
+
                     # Add/merge nvext.annotations
                     if "nvext" not in body:
                         body["nvext"] = {}
                     if not isinstance(body["nvext"], dict):
                         body["nvext"] = {}
-                    
+
                     existing = body["nvext"].get("annotations", [])
                     if not isinstance(existing, list):
                         existing = []
-                    
+
                     # Our annotations take precedence
                     body["nvext"]["annotations"] = annotations + [
                         a for a in existing
                         if not any(a.startswith(f"{key}:") for key in ["prefix_id", "total_requests", "osl", "iat"])
                     ]
-                    
+
                     # Re-encode
                     content = json.dumps(body).encode("utf-8")
                     headers["content-length"] = str(len(content))
-                    
+
                     logger.debug("Injected nvext.annotations: %s (body size: %d bytes)",
-                                 body["nvext"]["annotations"], len(content))
+                                 body["nvext"]["annotations"],
+                                 len(content))
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 logger.debug("Could not inject nvext.annotations: %s", e)
-        
+
         # Create a new request with modified headers and content
         new_request = httpx.Request(
             method=request.method,
@@ -351,9 +352,9 @@ class _DynamoTransport:
             content=content,
             extensions=request.extensions,
         )
-        
+
         return await self._transport.handle_async_request(new_request)
-    
+
     async def aclose(self):
         await self._transport.aclose()
 
@@ -395,9 +396,9 @@ def create_httpx_client_with_dynamo_hooks(
         prefix_id = prefix_template.format(uuid=unique_id)
     else:
         prefix_id = f"nat-dynamo-{unique_id}"
-    
+
     logger.debug("Created Dynamo client with prefix ID: %s", prefix_id)
-    
+
     # Create a base transport and wrap it with our custom transport
     base_transport = httpx.AsyncHTTPTransport()
     dynamo_transport = _DynamoTransport(
@@ -407,7 +408,7 @@ def create_httpx_client_with_dynamo_hooks(
         osl=osl,
         iat=iat,
     )
-    
+
     return httpx.AsyncClient(
         transport=dynamo_transport,
         timeout=httpx.Timeout(timeout),

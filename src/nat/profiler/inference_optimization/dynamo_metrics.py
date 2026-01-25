@@ -118,6 +118,8 @@ See ``external/dynamo/monitoring/README.md`` for the complete metrics reference.
 """
 
 import logging
+import math
+import time
 from typing import Any
 
 import httpx
@@ -200,7 +202,6 @@ METRIC_QUERIES: dict[str, str] = {
     "thompson_routing_decisions_rate": "rate(dynamo_component_thompson_routing_decisions_total[{range}])",
     "thompson_requests_rate": "rate(dynamo_component_thompson_requests_total[{range}])",
 }
-
 
 # =============================================================================
 # DATA MODELS
@@ -668,8 +669,6 @@ class DynamoMetricsCollector:
         Returns:
             DynamoMetricsResult with collected metric values
         """
-        import time
-
         result = DynamoMetricsResult(
             collection_timestamp=time.time(),
             prometheus_url=self.prometheus_url,
@@ -677,6 +676,27 @@ class DynamoMetricsCollector:
 
         # Build list of metrics to collect based on config toggles
         metrics_to_collect = self._get_enabled_metrics()
+
+        # Log collection parameters
+        if self.config.workflow_start_timestamp is not None:
+            if self.config.workflow_end_timestamp is not None:
+                duration = self.config.workflow_end_timestamp - self.config.workflow_start_timestamp
+                lookback_info = f"isolated_window={duration:.1f}s"
+            else:
+                lookback_info = f"workflow_start={self.config.workflow_start_timestamp:.2f}"
+        elif self.config.lookback_seconds > 0:
+            lookback_info = f"lookback={self.config.lookback_seconds}s"
+        else:
+            lookback_info = "lookback=600s (default)"
+
+        logger.info("Collecting %d Dynamo metrics from %s (query_range=%s, %s)",
+                    len(metrics_to_collect),
+                    self.prometheus_url,
+                    self.config.query_range,
+                    lookback_info)
+
+        collected_count = 0
+        null_count = 0
 
         # Collect each metric
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -689,11 +709,30 @@ class DynamoMetricsCollector:
                     if value is not None:
                         setattr(result, metric_name, value)
                         logger.debug("Collected %s = %s", metric_name, value)
+                        collected_count += 1
+                    else:
+                        logger.debug("No data for metric %s", metric_name)
+                        null_count += 1
 
                 except Exception as e:
                     error_msg = f"Failed to collect {metric_name}: {e}"
                     logger.warning(error_msg)
                     result.errors.append(error_msg)
+
+        logger.info("Dynamo metrics collection complete: %d collected, %d null, %d errors",
+                    collected_count,
+                    null_count,
+                    len(result.errors))
+
+        # Log summary of key metrics for debugging
+        core = result.get_core_metrics()
+        if core.ttft_p95_seconds is not None or core.itl_p95_seconds is not None:
+            logger.info("Core metrics - TTFT P95: %s, ITL P95: %s, KV Efficiency: %s",
+                        core.ttft_p95_seconds,
+                        core.itl_p95_seconds,
+                        core.kv_efficiency)
+        else:
+            logger.warning("Core metrics (TTFT, ITL) not available - check Prometheus connectivity and metric names")
 
         return result
 
@@ -718,8 +757,7 @@ class DynamoMetricsCollector:
                 "kve_prompt_tokens_rate",
                 "kve_device_blocks_rate",
                 "kve_host_blocks_rate",
-                "kve_disk_blocks_rate",
-                # Supplementary KV cache metrics
+                "kve_disk_blocks_rate",  # Supplementary KV cache metrics
                 "kv_cache_usage_percent",
                 "kv_cache_hit_rate_sglang",  # Fallback for KVE
                 "kv_cache_hit_rate_dynamo",
@@ -747,7 +785,32 @@ class DynamoMetricsCollector:
 
     async def _query_prometheus(self, client: httpx.AsyncClient, query: str) -> float | None:
         """
-        Execute a Prometheus instant query and extract the scalar result.
+        Execute a Prometheus query and extract the scalar result.
+
+        First attempts an instant query. If no data is returned (e.g., because
+        rate() returns 0 after workflow completion), falls back to a range query
+        with historical lookback to capture the most recent non-zero value.
+
+        Args:
+            client: httpx AsyncClient
+            query: PromQL query string
+
+        Returns:
+            Float value if successful, None if no data or error
+        """
+        # First try instant query
+        value = await self._query_prometheus_instant(client, query)
+        if value is not None:
+            return value
+
+        # If instant query failed, try range query with lookback
+        # This captures historical data when rate() returns 0 after workflow completes
+        logger.debug("Instant query returned no data, trying range query with lookback: %s", query)
+        return await self._query_prometheus_range(client, query)
+
+    async def _query_prometheus_instant(self, client: httpx.AsyncClient, query: str) -> float | None:
+        """
+        Execute a Prometheus instant query.
 
         Args:
             client: httpx AsyncClient
@@ -765,13 +828,13 @@ class DynamoMetricsCollector:
         data = response.json()
 
         if data.get("status") != "success":
-            logger.warning("Prometheus query failed: %s", data.get("error", "unknown"))
+            logger.warning("Prometheus instant query failed: %s", data.get("error", "unknown"))
             return None
 
         results = data.get("data", {}).get("result", [])
 
         if not results:
-            logger.debug("No data for query: %s", query)
+            logger.debug("No data for instant query: %s", query)
             return None
 
         # For instant queries, extract the value from the first result
@@ -781,12 +844,133 @@ class DynamoMetricsCollector:
             value = float(value_str)
 
             # Handle special float values
-            if value != value:  # NaN check
+            if math.isnan(value):
+                logger.debug("Instant query returned NaN for: %s", query)
+                return None
+
+            # Zero values from rate() after activity stops are not useful
+            if value == 0.0:
+                logger.debug("Instant query returned 0.0 for rate-based query: %s", query)
                 return None
 
             return value
         except (KeyError, IndexError, ValueError) as e:
-            logger.debug("Failed to parse Prometheus result for query '%s': %s", query, e)
+            logger.debug("Failed to parse Prometheus instant result for query '%s': %s", query, e)
+            return None
+
+    async def _query_prometheus_range(self, client: httpx.AsyncClient, query: str) -> float | None:
+        """
+        Execute a Prometheus range query with historical lookback.
+
+        This captures metrics that were recorded during the workflow execution
+        but are no longer updating (rate() would return 0 for instant queries).
+
+        The time window is determined by:
+        1. If workflow timestamps are set: query from workflow start to workflow end (isolated to this eval)
+        2. If lookback_seconds is set: query that many seconds back from now
+        3. Otherwise: default to 10 minutes (600 seconds)
+
+        Args:
+            client: httpx AsyncClient
+            query: PromQL query string
+
+        Returns:
+            The most recent non-NaN, non-zero value if found, None otherwise
+        """
+        url = f"{self.prometheus_url}/api/v1/query_range"
+
+        # Determine time window based on config
+        # Priority: workflow timestamps > lookback_seconds > default 600s
+        if self.config.workflow_start_timestamp is not None:
+            # Use exact workflow time window (no buffer before, small buffer after for scrape delay)
+            # No buffer before: avoids any risk of including pre-workflow empty data
+            # Small buffer after (15s): accounts for Prometheus scrape interval
+            start_time = self.config.workflow_start_timestamp
+
+            if self.config.workflow_end_timestamp is not None:
+                # Use actual workflow end time + small buffer for scrape delay
+                end_time = self.config.workflow_end_timestamp + 15.0
+                logger.debug("Using isolated workflow time window: %.2f to %.2f (%.1f seconds)",
+                             start_time,
+                             end_time,
+                             end_time - start_time)
+            else:
+                # Fall back to current time if end timestamp not set
+                end_time = time.time()
+                logger.debug("Using workflow start with current time: %.2f to %.2f (%.1f seconds)",
+                             start_time,
+                             end_time,
+                             end_time - start_time)
+        elif self.config.lookback_seconds > 0:
+            end_time = time.time()
+            start_time = end_time - self.config.lookback_seconds
+            logger.debug("Using configured lookback for range query: %.1f seconds", self.config.lookback_seconds)
+        else:
+            # Default to 10 minutes (600 seconds) for backward compatibility
+            end_time = time.time()
+            start_time = end_time - 600
+            logger.debug("Using default 10-minute lookback for range query")
+
+        # Use 15s step to get reasonable granularity
+        step = "15s"
+
+        params = {
+            "query": query,
+            "start": start_time,
+            "end": end_time,
+            "step": step,
+        }
+
+        try:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+
+            data = response.json()
+
+            if data.get("status") != "success":
+                logger.warning("Prometheus range query failed: %s", data.get("error", "unknown"))
+                return None
+
+            results = data.get("data", {}).get("result", [])
+
+            if not results:
+                logger.debug("No data for range query: %s", query)
+                return None
+
+            # Range query result format:
+            # [{"metric": {...}, "values": [[timestamp, "value_string"], ...]}]
+            # Collect all valid (non-NaN, non-zero) values and compute the average
+            # This gives a representative measurement across the entire workflow
+            valid_values: list[float] = []
+
+            for series in results:
+                values = series.get("values", [])
+                for timestamp_val, value_str in values:
+                    try:
+                        value = float(value_str)
+                        if not math.isnan(value) and value != 0.0:
+                            valid_values.append(value)
+                    except (ValueError, TypeError):
+                        continue
+
+            if valid_values:
+                # Use average for a representative measurement across the workflow
+                avg_value = sum(valid_values) / len(valid_values)
+                min_value = min(valid_values)
+                max_value = max(valid_values)
+                logger.debug("Range query found %d valid samples for %s: avg=%.4f, min=%.4f, max=%.4f",
+                             len(valid_values),
+                             query,
+                             avg_value,
+                             min_value,
+                             max_value)
+                return avg_value
+
+            logger.debug("Range query found no valid values for: %s", query)
+            return None
+
+        except Exception as e:
+            logger.debug("Range query failed for '%s': %s", query, e)
             return None
 
     async def health_check(self) -> dict[str, Any]:
@@ -896,4 +1080,3 @@ async def collect_core_metrics(
     )
     result = await collect_dynamo_metrics(config)
     return result.get_core_metrics()
-
