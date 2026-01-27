@@ -104,6 +104,7 @@ KVE metrics require the underlying engine to return cache efficiency data:
 import argparse
 import asyncio
 import logging
+import os
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -352,14 +353,23 @@ class ProcessorRequestHandler:
             await self.router_pick_client.wait_for_instances()
             logger.info("Router clients initialized successfully")
 
-        # Connect to actual workers at workers.worker.generate
+        # Connect to actual workers at workers.{component}.generate
         # Workers are in the "workers" namespace (hidden from frontend discovery)
         # while this processor is in "dynamo" namespace (frontend discovers us)
-        worker_component = self.runtime.namespace("workers").component("worker")
+        # Component name varies by backend (REQUIRED - no default):
+        #   - SGLang: uses "worker" (set via --endpoint workers.worker.generate)
+        #   - vLLM: uses "backend" (hardcoded in dynamo.vllm)
+        worker_component_name = os.environ.get("DYNAMO_WORKER_COMPONENT")
+        if not worker_component_name:
+            raise ValueError(
+                "DYNAMO_WORKER_COMPONENT environment variable is required. "
+                "Set to 'worker' for SGLang or 'backend' for vLLM."
+            )
+        worker_component = self.runtime.namespace("workers").component(worker_component_name)
         self.engine_client = await worker_component.endpoint("generate").client()
-        logger.info("Engine client created, waiting for worker instances...")
+        logger.info("Engine client created for workers/%s/generate, waiting for worker instances...", worker_component_name)
         await self.engine_client.wait_for_instances()
-        logger.info("Processor initialized successfully (routing to workers.worker.generate)")
+        logger.info("Processor initialized successfully (routing to workers/%s/generate)", worker_component_name)
 
     # ---- annotation extraction ----
     @staticmethod

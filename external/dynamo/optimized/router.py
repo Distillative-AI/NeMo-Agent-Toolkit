@@ -594,11 +594,19 @@ class WorkloadAwareRouter:
         # Initialize Prometheus metrics
         self._metrics = _init_prometheus_metrics()
 
-        # Connect to actual SGLang workers at workers.worker.generate
+        # Connect to actual workers at workers.{component}.generate
         # Workers are in the "workers" namespace (hidden from frontend discovery)
-        # (NOT backend.generate - that's where the Processor registers to intercept frontend)
-        engine = self.runtime.namespace("workers").component("worker")
-        logger.info("Getting engine client for workers/worker/generate")
+        # Component name varies by backend (REQUIRED - no default):
+        #   - SGLang: uses "worker" (set via --endpoint workers.worker.generate)
+        #   - vLLM: uses "backend" (hardcoded in dynamo.vllm)
+        worker_component = os.environ.get("DYNAMO_WORKER_COMPONENT")
+        if not worker_component:
+            raise ValueError(
+                "DYNAMO_WORKER_COMPONENT environment variable is required. "
+                "Set to 'worker' for SGLang or 'backend' for vLLM."
+            )
+        engine = self.runtime.namespace("workers").component(worker_component)
+        logger.info("Getting engine client for workers/%s/generate", worker_component)
         self.engine_client = await engine.endpoint("generate").client()
 
         min_workers = int(self.min_workers)
