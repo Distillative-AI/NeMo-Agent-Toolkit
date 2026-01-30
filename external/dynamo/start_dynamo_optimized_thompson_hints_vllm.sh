@@ -53,7 +53,7 @@ set -euo pipefail
 # See env.example for documentation on each variable
 CONTAINER_NAME="dynamo-vllm"
 WORKER_GPUS="${DYNAMO_GPU_DEVICES:-0,1,2,3,4,5,6,7}"
-TP_SIZE="${DYNAMO_TP_SIZE:-2}"
+TP_SIZE="${DYNAMO_TP_SIZE:-4}"
 HTTP_PORT="${DYNAMO_HTTP_PORT:-8000}"
 # Metrics ports - each component gets its own port to avoid conflicts
 # Using 18xxx range to avoid conflicts with common services
@@ -64,8 +64,38 @@ ROUTER_METRICS_PORT="${DYNAMO_ROUTER_METRICS_PORT:-18090}"
 PROCESSOR_METRICS_PORT="${DYNAMO_PROCESSOR_METRICS_PORT:-18091}"
 MODEL="/workspace/models/Llama-3.3-70B-Instruct"
 SERVED_MODEL_NAME="${DYNAMO_MODEL_NAME:-llama-3.3-70b}"
-# vLLM container image - update version as needed
-IMAGE="${DYNAMO_VLLM_IMAGE:-nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1}"
+
+# ============================================================================
+# MultiLRU Configuration Logic
+# ============================================================================
+# Default behavior (standard vLLM 0.7.1 image):
+#   - Uses router.py and processor.py (with @dynamo_worker(static=False))
+#   - Uses standard vLLM scheduler (no MultiLRU)
+#   - Works with nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1
+#
+# To enable MultiLRU (requires custom-built image):
+#   export DYNAMO_USE_MULTILRU=true
+#   export DYNAMO_VLLM_IMAGE=dynamo-multi-lru:latest
+#   bash start_dynamo_optimized_thompson_hints_vllm.sh
+# ============================================================================
+
+# Enforce safe defaults: only use multilru if EXPLICITLY enabled
+if [ "${DYNAMO_USE_MULTILRU:-}" != "true" ]; then
+    # Not explicitly set to true - use standard configuration
+    DYNAMO_USE_MULTILRU="false"
+    # If image wasn't explicitly set to custom multilru image, use standard
+    if [ "${DYNAMO_VLLM_IMAGE:-}" != "dynamo-multi-lru:latest" ]; then
+        IMAGE="nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1"
+    else
+        IMAGE="${DYNAMO_VLLM_IMAGE}"
+    fi
+else
+    # Explicitly enabled - use multilru configuration
+    DYNAMO_USE_MULTILRU="true"
+    # Default to custom image if not specified
+    IMAGE="${DYNAMO_VLLM_IMAGE:-dynamo-multi-lru:latest}"
+fi
+
 SHM_SIZE="${DYNAMO_SHM_SIZE:-16g}"
 WORKER_INIT_TIMEOUT_S="${DYNAMO_WORKER_INIT_TIMEOUT_S:-1800}"
 
@@ -137,6 +167,11 @@ CUSTOM_DYNAMO_DIR="${SCRIPT_DIR}/optimized"
 echo "========================================================="
 echo "Dynamo vLLM with OPTIMIZED Thompson Sampling Router"
 echo "========================================================="
+if [ "$DYNAMO_USE_MULTILRU" = "true" ]; then
+    echo "Configuration: MultiLRU Mode (custom image: $IMAGE)"
+else
+    echo "Configuration: Standard Mode (image: $IMAGE)"
+fi
 echo "Model: Llama-3.3-70B-Instruct"
 echo "Container: $CONTAINER_NAME"
 echo "HTTP Port: $HTTP_PORT (default Dynamo frontend)"
@@ -178,16 +213,27 @@ fi
 echo ""
 echo "========================================================="
 
-# Verify custom components exist
-if [ ! -f "$CUSTOM_DYNAMO_DIR/router.py" ]; then
-    echo "✗ ERROR: Custom router.py not found at: $CUSTOM_DYNAMO_DIR/router.py"
+# Select router/processor scripts based on DYNAMO_USE_MULTILRU
+if [ "$DYNAMO_USE_MULTILRU" = "true" ]; then
+    ROUTER_SCRIPT="router_multilru.py"
+    PROCESSOR_SCRIPT="processor_multilru.py"
+else
+    ROUTER_SCRIPT="router.py"
+    PROCESSOR_SCRIPT="processor.py"
+fi
+
+# Verify selected components exist
+if [ ! -f "$CUSTOM_DYNAMO_DIR/$ROUTER_SCRIPT" ]; then
+    echo "✗ ERROR: Custom $ROUTER_SCRIPT not found at: $CUSTOM_DYNAMO_DIR/$ROUTER_SCRIPT"
     exit 1
 fi
-if [ ! -f "$CUSTOM_DYNAMO_DIR/processor.py" ]; then
-    echo "✗ ERROR: Custom processor.py not found at: $CUSTOM_DYNAMO_DIR/processor.py"
+if [ ! -f "$CUSTOM_DYNAMO_DIR/$PROCESSOR_SCRIPT" ]; then
+    echo "✗ ERROR: Custom $PROCESSOR_SCRIPT not found at: $CUSTOM_DYNAMO_DIR/$PROCESSOR_SCRIPT"
     exit 1
 fi
 echo "✓ Custom components found in: $CUSTOM_DYNAMO_DIR"
+echo "  Router:    $ROUTER_SCRIPT"
+echo "  Processor: $PROCESSOR_SCRIPT"
 echo ""
 
 # Start ETCD if not running
@@ -375,6 +421,7 @@ docker run -d \
   -e MAX_NUM_SEQS=$MAX_NUM_SEQS \
   -e ENABLE_KV_EVENTS=$ENABLE_KV_EVENTS \
   -e KV_EVENT_BASE_PORT=$KV_EVENT_BASE_PORT \
+  -e DYNAMO_USE_MULTILRU=$DYNAMO_USE_MULTILRU \
   -e DYNAMO_WORKER_COMPONENT=backend \
   $IMAGE \
   bash -c "
@@ -577,6 +624,16 @@ docker run -d \
         # Build KV events config JSON for this worker (unique endpoint per worker)
         KV_EVENTS_JSON=\"{\\\"enable_kv_cache_events\\\":true,\\\"publisher\\\":\\\"zmq\\\",\\\"endpoint\\\":\\\"tcp://*:\$KV_EVENT_PORT\\\"}\"
         
+        # Build scheduler class option - use DynamoScheduler for MultiLruBackend if available
+        # Set DYNAMO_USE_MULTILRU=false to disable
+        SCHEDULER_OPT=\"\"
+        if [ \"\${DYNAMO_USE_MULTILRU:-false}\" = \"true\" ]; then
+            SCHEDULER_OPT=\"--scheduler-cls kvbm.v2.vllm.schedulers.dynamo.DynamoScheduler\"
+            echo \"  Scheduler: DynamoScheduler with MultiLruBackend (frequency-based eviction)\"
+        else
+            echo \"  Scheduler: Default vLLM scheduler\"
+        fi
+        
         if [ \"\$ENABLE_KV_EVENTS\" = \"true\" ]; then
             CUDA_VISIBLE_DEVICES=\$WORKER_GPU_LIST \
             DYN_SYSTEM_PORT=\$((WORKER_METRICS_PORT + i)) \
@@ -592,6 +649,7 @@ docker run -d \
               --block-size $KV_BLOCK_SIZE \
               --gpu-memory-utilization $GPU_MEMORY_UTILIZATION \
               --max-num-seqs $MAX_NUM_SEQS \
+              \$SCHEDULER_OPT \
               \$GPU_BLOCKS_OVERRIDE_OPT \
               --kv-events-config \"\$KV_EVENTS_JSON\" &
         else
@@ -609,6 +667,7 @@ docker run -d \
               --block-size $KV_BLOCK_SIZE \
               --gpu-memory-utilization $GPU_MEMORY_UTILIZATION \
               --max-num-seqs $MAX_NUM_SEQS \
+              \$SCHEDULER_OPT \
               \$GPU_BLOCKS_OVERRIDE_OPT &
         fi
         WORKER_PIDS+=(\$!)
@@ -641,7 +700,7 @@ docker run -d \
     # It needs workers to be present (started in Step 1)
     # DYN_SYSTEM_PORT sets the Prometheus metrics port for this component
     DYN_SYSTEM_PORT=\$ROUTER_METRICS_PORT \
-    python3 /workspace/custom_dynamo/router.py \
+    python3 /workspace/custom_dynamo/$ROUTER_SCRIPT \
       --config /workspace/custom_dynamo/config.yaml &
     ROUTER_PID=\$!
     echo \"Router PID: \$ROUTER_PID\"
@@ -658,7 +717,7 @@ docker run -d \
     # --static-endpoint on the frontend to find it.
     # DYN_SYSTEM_PORT sets the Prometheus metrics port for this component
     DYN_SYSTEM_PORT=\$PROCESSOR_METRICS_PORT \
-    python3 /workspace/custom_dynamo/processor.py \
+    python3 /workspace/custom_dynamo/$PROCESSOR_SCRIPT \
       --enable-router \
       --model-path $MODEL \
       --model-name $SERVED_MODEL_NAME &
@@ -826,6 +885,13 @@ if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     echo "  GPU Mem Utilization: $GPU_MEMORY_UTILIZATION (DYNAMO_GPU_MEMORY_UTILIZATION)"
     echo "  Max Concurrent Seqs: $MAX_NUM_SEQS (DYNAMO_MAX_NUM_SEQS)"
     echo "  KV Events: $ENABLE_KV_EVENTS (DYNAMO_ENABLE_KV_EVENTS)"
+    if [ "${DYNAMO_USE_MULTILRU:-false}" = "true" ]; then
+        echo "  Scheduler: DynamoScheduler with MultiLruBackend (DYNAMO_USE_MULTILRU=true)"
+        echo "    → 4-pool system: Cold→Warm→Hot→VeryHot"
+        echo "    → Promotion thresholds: [2, 6, 15] accesses"
+    else
+        echo "  Scheduler: Default vLLM scheduler (DYNAMO_USE_MULTILRU=false)"
+    fi
     echo ""
     echo "API Endpoint: http://localhost:$HTTP_PORT/v1/chat/completions"
     echo "Health Check: http://localhost:$HTTP_PORT/health"
