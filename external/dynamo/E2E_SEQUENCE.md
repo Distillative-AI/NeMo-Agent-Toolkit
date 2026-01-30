@@ -606,7 +606,7 @@ flowchart LR
     FE["Frontend<br/>ModelWatcher<br/>namespace=dynamo"]
     
     FE -.->|"Discovers"| P
-    FE -.x|"Cannot see"| Workers
+    FE -.-x|"Cannot see"| Workers
     
     P -->|"Queries"| R
     P -->|"Forwards to"| W1
