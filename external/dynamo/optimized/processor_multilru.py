@@ -221,7 +221,10 @@ class ProcessorMetrics:
         Args:
             endpoint: Dynamo endpoint object for registering metrics callback.
         """
-        from prometheus_client import Counter, Gauge, Histogram, REGISTRY
+        from prometheus_client import REGISTRY
+        from prometheus_client import Counter
+        from prometheus_client import Gauge
+        from prometheus_client import Histogram
 
         # Request throughput (prefixed with thompson_ to avoid conflicts with
         # serve_endpoint's built-in work handler metrics)
@@ -299,9 +302,7 @@ class ProcessorMetrics:
 
         # Register metrics with Dynamo's endpoint for /metrics exposure
         from dynamo.common.utils.prometheus import register_engine_metrics_callback
-        register_engine_metrics_callback(
-            endpoint, REGISTRY, metric_prefix_filters=["thompson_"]
-        )
+        register_engine_metrics_callback(endpoint, REGISTRY, metric_prefix_filters=["thompson_"])
 
         logger.info("Processor metrics initialized via prometheus_client")
 
@@ -366,13 +367,12 @@ class ProcessorRequestHandler:
         #   - vLLM: uses "backend" (hardcoded in dynamo.vllm)
         worker_component_name = os.environ.get("DYNAMO_WORKER_COMPONENT")
         if not worker_component_name:
-            raise ValueError(
-                "DYNAMO_WORKER_COMPONENT environment variable is required. "
-                "Set to 'worker' for SGLang or 'backend' for vLLM."
-            )
+            raise ValueError("DYNAMO_WORKER_COMPONENT environment variable is required. "
+                             "Set to 'worker' for SGLang or 'backend' for vLLM.")
         worker_component = self.runtime.namespace("workers").component(worker_component_name)
         self.engine_client = await worker_component.endpoint("generate").client()
-        logger.info("Engine client created for workers/%s/generate, waiting for worker instances...", worker_component_name)
+        logger.info("Engine client created for workers/%s/generate, waiting for worker instances...",
+                    worker_component_name)
         await self.engine_client.wait_for_instances()
         logger.info("Processor initialized successfully (routing to workers/%s/generate)", worker_component_name)
 
@@ -420,7 +420,7 @@ class ProcessorRequestHandler:
         if iat not in ("LOW", "MEDIUM", "HIGH"):
             iat = "MEDIUM"
 
-        # Extract backend selection (determines v1 vs v2 routing) 
+        # Extract backend selection (determines v1 vs v2 routing)
         backend_selector = self._extract_annotation(annotations, "backend")
         use_frequency_backend = backend_selector == "frequency_multi_lru" if backend_selector else False
 
@@ -699,7 +699,7 @@ class ProcessorRequestHandler:
 
             # Determine KVBM routing path based on backend selection
             kvbm_version = "v2" if use_frequency_backend else "v1"
-            
+
             # Get token IDs from preprocessed request
             token_ids = raw.get("token_ids", [])
             if not isinstance(token_ids, list):

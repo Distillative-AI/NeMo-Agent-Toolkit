@@ -36,16 +36,18 @@ Usage:
 
 import argparse
 import json
+import re
 import signal
 import sys
-import time
 import threading
+import time
 import urllib.request
-import re
 from collections import defaultdict
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Optional, List
+from dataclasses import dataclass
+from dataclasses import field
+from datetime import UTC
+from datetime import datetime
+from typing import Any
 
 try:
     import zmq
@@ -81,34 +83,34 @@ class KVCacheStats:
     hash_to_blocks: dict = field(default_factory=lambda: defaultdict(list))
     last_event_time: float = 0.0
     last_seq: int = -1
-    
-    def record_stored(self, block_hashes: List[Any], parent_hash: Any = None):
+
+    def record_stored(self, block_hashes: list[Any], parent_hash: Any = None):
         """Record BlockStored event."""
         self.last_event_time = time.time()
         for bh in block_hashes:
             h = format_hash(bh)
             self.stored_blocks += 1
             self.unique_hashes.add(h)
-    
-    def record_removed(self, block_hashes: List[Any]):
+
+    def record_removed(self, block_hashes: list[Any]):
         """Record BlockRemoved event."""
         self.last_event_time = time.time()
         for bh in block_hashes:
             h = format_hash(bh)
             self.evicted_blocks += 1
             self.unique_hashes.discard(h)
-    
+
     def record_cleared(self):
         """Record AllBlocksCleared event."""
         self.last_event_time = time.time()
         self.cleared_count += 1
         self.unique_hashes.clear()
-    
+
     def record_cache_hit(self, hit_tokens: int, query_tokens: int):
         """Record cache hit from metrics delta."""
         self.cache_hit_tokens += hit_tokens
         self.cache_query_tokens += query_tokens
-    
+
     def summary(self) -> dict:
         """Return summary statistics."""
         hit_rate = (self.cache_hit_tokens / self.cache_query_tokens * 100) if self.cache_query_tokens > 0 else 0
@@ -131,14 +133,14 @@ class KVEventObserver:
     Also optionally polls Prometheus metrics to detect cache hits,
     which don't generate ZMQ events.
     """
-    
+
     def __init__(
         self,
         host: str = "localhost",
         port: int = 20080,
         verbose: bool = False,
-        output_file: Optional[str] = None,
-        metrics_port: Optional[int] = None,
+        output_file: str | None = None,
+        metrics_port: int | None = None,
     ):
         self.host = host
         self.port = port
@@ -148,15 +150,15 @@ class KVEventObserver:
         self.stats = KVCacheStats()
         self.running = False
         self._output_handle = None
-        
+
         # Metrics polling state
         self._last_hits = 0.0
         self._last_queries = 0.0
         self._metrics_thread = None
-        
+
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.SUB)
-    
+
     def _parse_metric(self, metrics_text: str, metric_name: str) -> float:
         """Extract a metric value from Prometheus text format."""
         pattern = rf'^{re.escape(metric_name)}\{{[^}}]*\}}\s+([0-9.e+-]+)'
@@ -165,42 +167,44 @@ class KVEventObserver:
             if match:
                 return float(match.group(1))
         return 0.0
-    
+
     def _poll_metrics(self):
         """Background thread to poll Prometheus metrics for cache hits."""
         metrics_url = f"http://{self.host}:{self.metrics_port}/metrics"
-        
+
         while self.running:
             try:
                 with urllib.request.urlopen(metrics_url, timeout=2) as resp:
                     metrics_text = resp.read().decode('utf-8')
-                
+
                 hits = self._parse_metric(metrics_text, 'vllm:prefix_cache_hits_total')
                 queries = self._parse_metric(metrics_text, 'vllm:prefix_cache_queries_total')
-                
+
                 # Calculate deltas
                 hit_delta = hits - self._last_hits
                 query_delta = queries - self._last_queries
-                
+
                 if hit_delta > 0:
                     # Cache hit detected!
                     self.stats.record_cache_hit(int(hit_delta), int(query_delta))
                     if self.verbose:
                         hit_rate = (hit_delta / query_delta * 100) if query_delta > 0 else 0
-                        print(f"✅ [CACHE HIT] tokens={int(hit_delta):4d} queried={int(query_delta):4d} hit_rate={hit_rate:.0f}%")
+                        print(
+                            f"✅ [CACHE HIT] tokens={int(hit_delta):4d} queried={int(query_delta):4d} hit_rate={hit_rate:.0f}%"
+                        )
                 elif query_delta > 0:
                     # Queries happened but no hits (cache miss)
                     self.stats.record_cache_hit(0, int(query_delta))
-                
+
                 self._last_hits = hits
                 self._last_queries = queries
-                
+
             except Exception as e:
                 if self.verbose:
                     print(f"[Metrics] Poll error: {e}")
-            
+
             time.sleep(0.5)  # Poll every 500ms
-        
+
     def connect(self):
         """Connect to the vLLM KV event publisher."""
         endpoint = f"tcp://{self.host}:{self.port}"
@@ -209,12 +213,12 @@ class KVEventObserver:
         # Subscribe to all topics (empty string = all)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
         self.socket.setsockopt(zmq.RCVTIMEO, 1000)
-        print(f"[KV Observer] ✓ Connected and subscribed")
-        
+        print("[KV Observer] ✓ Connected and subscribed")
+
         if self.output_file:
             self._output_handle = open(self.output_file, "a")
             print(f"[KV Observer] Writing events to: {self.output_file}")
-        
+
         if self.metrics_port:
             print(f"[KV Observer] Polling metrics at http://{self.host}:{self.metrics_port}/metrics")
             # Initialize baseline metrics
@@ -227,8 +231,8 @@ class KVEventObserver:
                 print(f"[KV Observer] ✓ Baseline: hits={self._last_hits:.0f} queries={self._last_queries:.0f}")
             except Exception as e:
                 print(f"[KV Observer] ⚠ Could not get baseline metrics: {e}")
-    
-    def parse_multipart(self, parts: List[bytes]) -> Optional[dict]:
+
+    def parse_multipart(self, parts: list[bytes]) -> dict | None:
         """Parse a ZMQ multipart message from vLLM.
         
         Format: [topic, sequence, payload]
@@ -240,19 +244,19 @@ class KVEventObserver:
             if self.verbose:
                 print(f"[KV Observer] Warning: Expected 3 parts, got {len(parts)}")
             return None
-        
+
         topic, seq_bytes, payload = parts[0], parts[1], parts[2]
-        
+
         try:
             seq = int.from_bytes(seq_bytes, "big", signed=True)
             self.stats.last_seq = seq
         except Exception:
             seq = -1
-        
+
         try:
             # Decode msgpack payload
             batch = msgpack.unpackb(payload, raw=False, strict_map_key=False)
-            
+
             # vLLM KVEventBatch format: [timestamp, events_list, dp_rank]
             # Note: events is at index 1, dp_rank at index 2!
             if isinstance(batch, (list, tuple)) and len(batch) >= 3:
@@ -267,11 +271,11 @@ class KVEventObserver:
                 events = [batch] if batch else []
                 ts = time.time()
                 dp_rank = 0
-            
+
             # Ensure events is a list
             if not isinstance(events, list):
                 events = [events] if events else []
-            
+
             return {
                 "seq": seq,
                 "timestamp": ts,
@@ -284,14 +288,14 @@ class KVEventObserver:
                 print(f"[KV Observer] Parse error: {e}")
                 print(f"[KV Observer]   Raw payload: {payload[:100]}...")
             return None
-    
+
     def handle_event(self, event_data: dict):
         """Handle a parsed event batch."""
         seq = event_data.get("seq", -1)
         ts = event_data.get("timestamp", 0)
         dp_rank = event_data.get("dp_rank", 0)
         events = event_data.get("events", [])
-        
+
         for event in events:
             # Events can be dicts or tuples/lists
             # vLLM format (list):
@@ -307,7 +311,7 @@ class KVEventObserver:
                 block_size = event.get("block_size", 0)
             elif isinstance(event, (list, tuple)) and len(event) >= 1:
                 event_type = str(event[0]) if event else "unknown"
-                
+
                 if event_type == "BlockRemoved" and len(event) >= 2:
                     # ['BlockRemoved', [hashes], medium]
                     block_hashes = event[1] if isinstance(event[1], list) else [event[1]]
@@ -341,16 +345,17 @@ class KVEventObserver:
                 medium = "GPU"
                 token_ids = []
                 block_size = 0
-            
+
             # Normalize event type (vLLM uses class names like "BlockStored")
             event_type_lower = event_type.lower()
-            
+
             if "stored" in event_type_lower or "blockstored" in event_type_lower:
                 self.stats.record_stored(block_hashes, parent_hash)
                 if self.verbose:
                     num_tokens = len(token_ids) if token_ids else block_size
                     for bh in block_hashes:
-                        print(f"📦 [STORED  ] seq={seq:6d} hash={format_hash(bh)} tokens={num_tokens:3d} medium={medium}")
+                        print(
+                            f"📦 [STORED  ] seq={seq:6d} hash={format_hash(bh)} tokens={num_tokens:3d} medium={medium}")
             elif "removed" in event_type_lower or "blockremoved" in event_type_lower:
                 self.stats.record_removed(block_hashes)
                 if self.verbose:
@@ -360,12 +365,14 @@ class KVEventObserver:
                 self.stats.record_cleared()
                 if self.verbose:
                     print(f"🧹 [CLEARED ] seq={seq:6d} All blocks cleared")
-            else:
-                if self.verbose:
-                    print(f"❓ [UNKNOWN ] seq={seq:6d} type={event_type} data={event[:3] if isinstance(event, (list, tuple)) else event}")
-        
+            elif self.verbose:
+                print(
+                    f"❓ [UNKNOWN ] seq={seq:6d} type={event_type} data={event[:3] if isinstance(event, (list, tuple)) else event}"
+                )
+
         # Write to output file
         if self._output_handle:
+
             def get_event_type(e):
                 if isinstance(e, dict):
                     return str(e.get("type", "unknown"))
@@ -373,94 +380,89 @@ class KVEventObserver:
                     return str(e[0])
                 else:
                     return str(e)
-            
+
             output = {
-                "_timestamp": datetime.now(timezone.utc).isoformat(),
+                "_timestamp": datetime.now(UTC).isoformat(),
                 "seq": seq,
                 "ts": ts,
                 "dp_rank": dp_rank,
-                "events": [{"type": get_event_type(e)} for e in events],
+                "events": [{
+                    "type": get_event_type(e)
+                } for e in events],
             }
             self._output_handle.write(json.dumps(output) + "\n")
             self._output_handle.flush()
-    
-    def run(self, duration: Optional[float] = None):
+
+    def run(self, duration: float | None = None):
         """Run the observer loop."""
         self.running = True
         start_time = time.time()
         batches_received = 0
-        
+
         # Start metrics polling thread if configured
         if self.metrics_port:
-            self._metrics_thread = threading.Thread(
-                target=self._poll_metrics,
-                daemon=True,
-                name="metrics-poller"
-            )
+            self._metrics_thread = threading.Thread(target=self._poll_metrics, daemon=True, name="metrics-poller")
             self._metrics_thread.start()
-        
-        print(f"[KV Observer] Listening for KV events (msgpack multipart)...")
+
+        print("[KV Observer] Listening for KV events (msgpack multipart)...")
         if self.metrics_port:
-            print(f"[KV Observer] Cache hits will show as ✅ [CACHE HIT]")
-        print(f"[KV Observer] Press Ctrl+C to stop")
+            print("[KV Observer] Cache hits will show as ✅ [CACHE HIT]")
+        print("[KV Observer] Press Ctrl+C to stop")
         print("-" * 60)
-        
+
         try:
             while self.running:
                 if duration and (time.time() - start_time) >= duration:
                     print(f"\n[KV Observer] Duration limit reached ({duration}s)")
                     break
-                
+
                 try:
                     # Receive multipart message
                     parts = self.socket.recv_multipart()
                     event_data = self.parse_multipart(parts)
-                    
+
                     if event_data:
                         self.handle_event(event_data)
                         batches_received += 1
-                        
+
                         if batches_received % 20 == 0 and not self.verbose:
                             summary = self.stats.summary()
-                            print(
-                                f"[{batches_received:5d} batches] "
-                                f"Stored: {summary['stored_blocks']:4d} | "
-                                f"Removed: {summary['evicted_blocks']:4d} | "
-                                f"Net: {summary['net_blocks']:4d} | "
-                                f"Hashes: {summary['unique_hashes_current']} | "
-                                f"Seq: {summary['last_seq']}"
-                            )
+                            print(f"[{batches_received:5d} batches] "
+                                  f"Stored: {summary['stored_blocks']:4d} | "
+                                  f"Removed: {summary['evicted_blocks']:4d} | "
+                                  f"Net: {summary['net_blocks']:4d} | "
+                                  f"Hashes: {summary['unique_hashes_current']} | "
+                                  f"Seq: {summary['last_seq']}")
                 except zmq.Again:
                     # Timeout, continue loop
                     continue
-                    
+
         except KeyboardInterrupt:
             print("\n[KV Observer] Interrupted")
         finally:
             self.stop()
-    
+
     def stop(self):
         """Stop and print final statistics."""
         self.running = False
-        
+
         print("-" * 60)
         print("[KV Observer] Final Statistics:")
         for key, value in self.stats.summary().items():
             print(f"  {key}: {value}")
-        
+
         if self._output_handle:
             self._output_handle.close()
-        
+
         self.socket.close()
         self.context.term()
         print("[KV Observer] Stopped")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Observe KV cache events from vLLM workers",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+    parser = argparse.ArgumentParser(description="Observe KV cache events from vLLM workers",
+                                     formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     epilog="""
 Examples:
   # Monitor worker 0 (ZMQ events only):
   python kv_event_observer.py -p 20080 -v
@@ -481,17 +483,19 @@ Event types:
   📦 STORED   - Block committed to prefix cache (ZMQ)
   🗑️ REMOVED  - Block evicted from cache (ZMQ)
   ✅ CACHE HIT - Tokens served from cache (metrics polling)
-"""
-    )
+""")
     parser.add_argument("--host", "-H", default="localhost", help="Worker host (default: localhost)")
     parser.add_argument("--port", "-p", type=int, default=20080, help="KV event ZMQ port (default: 20080)")
-    parser.add_argument("--metrics-port", "-m", type=int, help="Prometheus metrics port for cache hit detection (e.g., 18081)")
+    parser.add_argument("--metrics-port",
+                        "-m",
+                        type=int,
+                        help="Prometheus metrics port for cache hit detection (e.g., 18081)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print each event")
     parser.add_argument("--output", "-o", help="Output file (JSONL format)")
     parser.add_argument("--duration", "-d", type=float, help="Run duration in seconds")
-    
+
     args = parser.parse_args()
-    
+
     observer = KVEventObserver(
         host=args.host,
         port=args.port,
@@ -499,10 +503,10 @@ Event types:
         output_file=args.output,
         metrics_port=args.metrics_port,
     )
-    
+
     signal.signal(signal.SIGINT, lambda s, f: setattr(observer, 'running', False))
     signal.signal(signal.SIGTERM, lambda s, f: setattr(observer, 'running', False))
-    
+
     observer.connect()
     observer.run(duration=args.duration)
 

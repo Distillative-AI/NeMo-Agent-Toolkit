@@ -601,10 +601,8 @@ class WorkloadAwareRouter:
         #   - vLLM: uses "backend" (hardcoded in dynamo.vllm)
         worker_component = os.environ.get("DYNAMO_WORKER_COMPONENT")
         if not worker_component:
-            raise ValueError(
-                "DYNAMO_WORKER_COMPONENT environment variable is required. "
-                "Set to 'worker' for SGLang or 'backend' for vLLM."
-            )
+            raise ValueError("DYNAMO_WORKER_COMPONENT environment variable is required. "
+                             "Set to 'worker' for SGLang or 'backend' for vLLM.")
         engine = self.runtime.namespace("workers").component(worker_component)
         logger.info("Getting engine client for workers/%s/generate", worker_component)
         self.engine_client = await engine.endpoint("generate").client()
